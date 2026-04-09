@@ -1,5 +1,6 @@
 # Use average of the mean for each feature to get gaussian distribution for the autoencoder, which is what it learns best. This is a common practice to improve AE performance when features have different scales or distributions.
 
+import logging
 import os
 import time
 import pickle
@@ -19,6 +20,15 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 warnings.filterwarnings("ignore")
 
+logging.basicConfig(level=logging.INFO,
+                    # filename='autoencoder_training.log',
+                    # filemode='w',
+                    format='%(levelname)s: %(message)s',
+                    force=True)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.info(f'Logger name: {logger.name} and level: {logger.level}')
+
 # ============================================================
 # Config
 # ============================================================
@@ -26,18 +36,19 @@ warnings.filterwarnings("ignore")
 @dataclass
 class Config:
     all_data_path: str = "/content/all_features_all_data.csv"
-    target_col: str = "us_aqi"
 
     # Split/scaling choices
     val_size: float = 0.20
     random_state: int = 10
-
+    scalers = [MinMaxScaler(), StandardScaler()]
     # Sequence settings for LSTM
     lookback: int = 24 # The number of previous sequences to "lookback" on
     horizon: int = 1 # The number of hour(s) to predict ahead
 
     # AE settings
-    latent_dim: int = 22
+    latent_dim: int = 16
+    latent_dims = [16, 8]
+    ae_layers = [[16], [8]]
     ae_hidden_dims: List[int] = field(default_factory=list)  # single bottleneck layer only
     ae_epochs: int = 50
     ae_lr: float = 1e-3
@@ -59,7 +70,7 @@ class Config:
     # Exact drop pattern from notebook feature selection
     cols_to_drop: List[str] = field(default_factory=lambda: [
         'latitude_y', 'longitude_y', 'city', 'state', 'month',
-        'day', 'hour', 'day_of_week', 'day_of_year', 'us_aqi'
+        'day', 'hour', 'day_of_week', 'day_of_year'
     ])
 
     @property
@@ -96,16 +107,21 @@ class AQI_LSTM(nn.Module):
 
 
 class TimeVariantAutoencoder(nn.Module):
-    def __init__(self, input_dim: int, latent_dim: int = 22):
+    def __init__(self, input_dim: int, latent_dim: int = 16, scaler=StandardScaler()):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, latent_dim),
             nn.ReLU(),
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, input_dim),
-            nn.Sigmoid(),
-        )
+        if scaler == MinMaxScaler:
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, input_dim),
+                nn.Sigmoid()
+            )
+        else:
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, input_dim)
+            )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         encoded = self.encoder(x)
@@ -124,45 +140,53 @@ class AIQTrainingPipeline:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.dataset_df = self.load_data(cfg.all_data_path)
+
+        if self.dataset_df is None:
+            raise ValueError("Failed to load data. Please check the file path and contents.")
         self.feature_cols: List[str] = []
-        self.ae_scaler = MinMaxScaler() # Use MinMaxScaler for autoencoder, StandardScaler for LSTM sequences (after AE transformation)
-        self.lstm_scaler = StandardScaler()
+        self.cyclic_cols = None
+        self.binary_cols = None
+        self.lag_cols = None
+        self.target_col = "us_aqi"
 
-        self.train_df = None
-        self.val_df_df = None
+        self.remove_nan()
+        self.remove_uninformative_features()
+        self.identify_features()
 
-        self.X_train = self.X_val = None
-        self.y_train = self.y_val = None
+        self.train_df, self.val_df = self.split_data()
 
-        self.X_train_seq = self.X_val_seq = None
-        self.y_train_seq = self.y_val_seq = None
+    def load_data(self, dataset_path):
+        dataset = pd.read_csv(dataset_path)
 
-        self.lag_data_cols = None
+        if dataset.empty:
+            logger.warning("The loaded DataFrame is empty. Please check the file path and contents.")
+            return None
+        else:
+            logger.info(f"Data loaded successfully with shape: {dataset.shape}")
+            logger.info(f'DataFrame columns: {dataset.columns.tolist()}')
 
-    def prepare(self) -> "AIQTrainingPipeline":
-        all_data_df, self.lag_data_cols = self._load_and_engineer()
-        self.train_df, self.val_df = self._split_scale(all_data_df)
+        return dataset
 
-        # AE gets raw features, LSTM gets AE-reduced features + past AQI sequences
-        self.X_train = self.train_df[self.feature_cols].values.astype(np.float32)
-        self.X_val = self.val_df[self.feature_cols].values.astype(np.float32)
+    def remove_nan(self):
+        initial_shape = self.dataset_df.shape
+        self.dataset_df.dropna(inplace=True)
+        logger.info(f"Removed NaN values. Shape changed from {initial_shape} to {self.dataset_df.shape}")
 
-        self.y_train = self.train_df[self.cfg.target_col].values.reshape(-1, 1).astype(np.float32)
-        self.y_val = self.val_df[self.cfg.target_col].values.reshape(-1, 1).astype(np.float32)
+    def remove_uninformative_features(self):
+        self.dataset_df.drop(columns=self.cfg.cols_to_drop, inplace=True)
+        logger.info(f"Removed uninformative features: {self.cfg.cols_to_drop}")
 
-        # grouped sequences for LSTM
-        self.X_train_seq, self.y_train_seq = self.make_sequences(self.train_df)
-        self.X_val_seq, self.y_val_seq = self.make_sequences(self.val_df)
+    def identify_cyclic_features(self):
+        cyclic_postfixes = ['_sin', '_cos']
+        self.cyclic_cols = [col for col in self.dataset_df.columns if any(col.endswith(postfix) for postfix in cyclic_postfixes)]
+        logger.info(f"Identified cyclic features: {self.cyclic_cols}")
 
-        print(f"Train rows: {self.train_df.shape}, Validation rows: {self.val_df.shape}")
-        print(f"Train seq: {self.X_train_seq.shape}, Validation seq: {self.X_val_seq.shape}")
-        return self
+    def identify_binary_features(self):
+        self.binary_cols = [col for col in self.dataset_df.columns if self.dataset_df[col].nunique() == 2 and col not in self.cyclic_cols]
+        logger.info(f"Identified binary features: {self.binary_cols}")
 
-    def _load_and_engineer(self) -> pd.DataFrame:
-        all_data_df = pd.read_csv(self.cfg.all_data_path)
-
-        all_data_df.dropna(inplace=True) # Drop rows with missing values to ensure clean training data for the autoencoder and LSTM
-
+    def identify_lag_features(self):
         lag_prefixes = [
             'us_aqi_past_',
             'pm2_5_past_',
@@ -171,30 +195,26 @@ class AIQTrainingPipeline:
             'wind_direction_10m_sin_past_',
             'wind_direction_10m_cos_past_',
         ]
+        self.lag_cols = [col for col in self.dataset_df.columns if any(col.startswith(prefix) for prefix in lag_prefixes)]
+        logger.info(f"Identified lag features: {self.lag_cols}")
 
-        lagged_features_to_remove = [
-            c for c in all_data_df.columns
-            if any(c.startswith(prefix) for prefix in lag_prefixes)
-        ]
-        
-        # IMPORTANT: do NOT drop zip yet
-        x = all_data_df.drop(columns=self.cfg.cols_to_drop)
-        lag_features_removed_df = x.drop(columns=lagged_features_to_remove)
+    def identify_feature_cols(self):
+        remove_cols = ['zip', 'time', 'us_aqi'] + self.cyclic_cols + self.binary_cols + self.lag_cols
+        self.feature_cols = [col for col in self.dataset_df.columns if col not in remove_cols]
+        logger.info(f"Feature columns: {self.feature_cols}")
+        logger.info(f"Number of feature columns: {len(self.feature_cols)}")
+    
+    def identify_features(self):
+        self.identify_cyclic_features()
+        self.identify_binary_features()
+        self.identify_lag_features()
+        self.identify_feature_cols()
 
-        # zip stays only for grouping, not as a model feature
-        self.feature_cols = [c for c in lag_features_removed_df.columns if c != "zip" and c != 'time']
-        self._df = all_data_df
-
-        print(f"Loaded: {all_data_df.shape}")
-        print(f"Target: {self.cfg.target_col}")
-        print(f"Features ({len(self.feature_cols)}): {self.feature_cols}")
-        return all_data_df, lagged_features_to_remove
-
-    def _split_scale(self, all_data_df: pd.DataFrame):
+    def split_data(self):
         train_parts = []
         val_parts = []
 
-        for zip_code, group in all_data_df.groupby("zip"):
+        for zip_code, group in self.dataset_df.groupby("zip"):
             group = group.sort_values("time").reset_index(drop=True)
             split_idx_train = int(len(group) * (1 - self.cfg.val_size))
 
@@ -204,29 +224,28 @@ class AIQTrainingPipeline:
         train_df = pd.concat(train_parts, axis=0).reset_index(drop=True)
         val_df = pd.concat(val_parts, axis=0).reset_index(drop=True)
 
-        train_df[self.feature_cols] = self.ae_scaler.fit_transform(
-            train_df[self.feature_cols].astype(np.float32)
-        )
-        val_df[self.feature_cols] = self.ae_scaler.transform(
-            val_df[self.feature_cols].astype(np.float32)
-        )
-
         return train_df, val_df
+    
+    def scale_features(self, unscaled_train_df: pd.DataFrame, unscaled_val_df: pd.DataFrame, scaler) -> Tuple[np.ndarray, np.ndarray]:
+        scaled_train = scaler.fit_transform(unscaled_train_df[self.feature_cols])
+        scaled_val = scaler.transform(unscaled_val_df[self.feature_cols])
+
+        return scaled_train, scaled_val
 
     @property
     def input_dim(self) -> int:
         return len(self.feature_cols)
 
     # Create 24 hour window sequences for LSTM training, grouped by zip code to maintain temporal integrity. Each sequence includes the past `lookback` hours of features
-    def make_sequences(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def make_lstm_sequences(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         lookback, horizon = self.cfg.lookback, self.cfg.horizon
         Xs, ys = [], []
 
         for zip_code, group in df.groupby("zip"):
             group = group.sort_values("time").reset_index(drop=True)
 
-            X = group[self.feature_cols].values.astype(np.float32)
-            y = group[self.cfg.target_col].values.astype(np.float32)
+            X = group.drop(columns=[self.target_col, 'zip', 'time']).to_numpy(dtype=np.float32)
+            y = group[self.target_col].to_numpy(dtype=np.float32)
 
             if len(group) < lookback + horizon:
                 continue
@@ -236,15 +255,14 @@ class AIQTrainingPipeline:
                 ys.append(y[i+lookback+horizon-1]) # target is the AQI at the end of the horizon
 
         return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
 # ============================================================
 # AE reducer
 # ============================================================
 
 class AEReducer:
-    def __init__(self, cfg: Config, input_dim: int):
+    def __init__(self, cfg: Config, input_dim: int, scaler=StandardScaler()):
         self.cfg = cfg
-        self.model = TimeVariantAutoencoder(input_dim=input_dim, latent_dim=cfg.latent_dim)
+        self.model = TimeVariantAutoencoder(input_dim=input_dim, latent_dim=cfg.latent_dim, scaler=scaler)
         self.train_history: List[float] = []
 
     def fit(self, X_train: np.ndarray):
@@ -412,14 +430,14 @@ def save_artifacts(save_dir: str, model: AQI_LSTM, ae_reducer: AEReducer,
             "lookback": cfg.lookback,
             "latent_dim": cfg.latent_dim,
             "feature_cols": pipeline.feature_cols,
-            "target_col": cfg.target_col,
+            "target_col": pipeline.target_col,
         },
         "metrics": metrics,
         "train_loss": loss_curves[0],
         "val_loss": loss_curves[1],
-    }, os.path.join(save_dir, "lstm_ae22.pt"))
+    }, os.path.join(save_dir, "lstm_ae16.pt"))
 
-    torch.save(ae_reducer.model.state_dict(), os.path.join(save_dir, "ae_22.pt"))
+    torch.save(ae_reducer.model.state_dict(), os.path.join(save_dir, "ae_16.pt"))
 
     with open(os.path.join(save_dir, "scalers.pkl"), "wb") as f:
         pickle.dump({
@@ -445,48 +463,43 @@ def run(cfg: Config):
     print("=" * 60)
     print("  DATA PIPELINE")
     print("=" * 60)
-    pipeline = AIQTrainingPipeline(cfg).prepare()
+    pipeline = AIQTrainingPipeline(cfg)
 
     print("\n" + "=" * 60)
     print("  TRAIN TIME-VARIANT AUTOENCODER")
     print("=" * 60)
-    ae = AEReducer(cfg, input_dim=pipeline.X_train.shape[1])
-    X_train_latent = ae.fit_transform(pipeline.X_train)
-    X_val_latent = ae.transform(pipeline.X_val)
+    # First scale features for the AE, not including cyclic/binary/lag features
+    X_train_ae, X_val_ae = pipeline.scale_features(pipeline.train_df[pipeline.feature_cols], pipeline.val_df[pipeline.feature_cols], scaler=StandardScaler())
 
-    # X_train_latent = pipeline.lstm_scaler.fit_transform(X_train_latent) # Scale the latent features for LSTM training using StandardScaler
-    # X_val_latent = pipeline.lstm_scaler.transform(X_val_latent)
+    # Append cyclic features to the AE input
+    X_train_ae = np.concatenate([X_train_ae, pipeline.train_df[pipeline.cyclic_cols].to_numpy(dtype=np.float32)], axis=1)
+    X_val_ae = np.concatenate([X_val_ae, pipeline.val_df[pipeline.cyclic_cols].to_numpy(dtype=np.float32)], axis=1)
 
-    latent_cols = [f"z{i}" for i in range(cfg.latent_dim)] # latent_dim is 32, so this will create z0, z1, ..., z21
+    ae = AEReducer(cfg, input_dim=X_train_ae.shape[1]) # Defaults to StandardScaler in AEReducer, which is what we want for the AE
+    X_train_latent = ae.fit_transform(X_train_ae)
+    X_val_latent = ae.transform(X_val_ae)
+    latent_cols = [f"z{i}" for i in range(cfg.latent_dim)] # latent_dim is 16, so this will create z0, z1, ..., z21
 
-    train_latent_df = pipeline.train_df[["zip", "time", cfg.target_col]].copy() # Get the original train_df structure with zip, time, and target_col
-    val_latent_df = pipeline.val_df[["zip", "time", cfg.target_col]].copy()
+    # Now create new train/val sets for LSTM
+    latent_train_df = pd.DataFrame(X_train_latent, columns=latent_cols)
+    latent_val_df = pd.DataFrame(X_val_latent, columns=latent_cols)
 
-    train_latent_df[latent_cols] = X_train_latent # Add the latent features to the train dataframe
-    val_latent_df[latent_cols] = X_val_latent
+    # Combine latent features with original binary/lag features for LSTM training, which are the most predictive of AQI and should be preserved in their original form (not scaled or encoded)
+    lstm_train_df = pd.concat([latent_train_df, pipeline.train_df.drop(columns=pipeline.feature_cols + pipeline.cyclic_cols)], axis=1)
+    lstm_val_df = pd.concat([latent_val_df, pipeline.val_df.drop(columns=pipeline.feature_cols + pipeline.cyclic_cols)], axis=1)
 
-    train_latent_df[pipeline.lag_data_cols] = pipeline.train_df[pipeline.lag_data_cols]
-    val_latent_df[pipeline.lag_data_cols] = pipeline.val_df[pipeline.lag_data_cols]
+    # Create sequences for LSTM training
+    X_train_lstm, y_train_lstm = pipeline.make_lstm_sequences(lstm_train_df)
+    X_val_lstm, y_val_lstm = pipeline.make_lstm_sequences(lstm_val_df)
 
-    original_feature_cols = pipeline.feature_cols.copy() # Save original feature columns to restore later
-    pipeline.feature_cols = latent_cols + pipeline.lag_data_cols
-
-    try:
-        X_train_seq, y_train_seq = pipeline.make_sequences(train_latent_df) # Generate sequences using the latent features
-        X_val_seq, y_val_seq = pipeline.make_sequences(val_latent_df)
-    finally:
-        pipeline.feature_cols = original_feature_cols
-
-    #X_train_seq.shape is (num_samples, lookback, num_features + 1) where num_features is the number of latent features (22) and the +1 is for the lagged target variable included in the sequence
-
-    print(f"Latent train seq: {X_train_seq.shape}")
-    print(f"Latent val  seq: {X_val_seq.shape}")
+    print(f"Latent train seq: {X_train_lstm.shape}")
+    print(f"Latent val  seq: {X_val_lstm.shape}")
 
     print("\n" + "=" * 60)
     print("  TRAIN LSTM")
     print("=" * 60)
     model = AQI_LSTM(
-        input_dim=X_train_seq.shape[2],
+        input_dim=X_train_lstm.shape[2],
         hidden_size=cfg.lstm_hidden,
         num_layers=cfg.lstm_layers,
         dropout=cfg.lstm_dropout,
@@ -494,20 +507,20 @@ def run(cfg: Config):
     trainer = LSTMTrainer(cfg)
     loss_curves = trainer.train(
         model,
-        X_train_seq,
-        y_train_seq,
-        X_val_seq,
-        y_val_seq,
+        X_train_lstm,
+        y_train_lstm,
+        X_val_lstm,
+        y_val_lstm,
         name="LSTM+AE22"
     )
 
     print("\n" + "=" * 60)
     print("  EVALUATION")
     print("=" * 60)
-    preds = trainer.predict(model, X_val_seq)
-    metrics = trainer.evaluate(y_val_seq, preds, label="LSTM+AE22")
+    preds = trainer.predict(model, X_val_lstm)
+    metrics = trainer.evaluate(y_val_lstm, preds, label="LSTM+AE22")
 
-    save_artifacts(cfg.save_dir, model, ae, pipeline, cfg, metrics, loss_curves, X_train_seq.shape[2])
+    save_artifacts(cfg.save_dir, model, ae, pipeline, cfg, metrics, loss_curves, X_train_lstm.shape[2])
 
     return {
         "pipeline": pipeline,
@@ -515,10 +528,10 @@ def run(cfg: Config):
         "model": model,
         "metrics": metrics,
         "loss_curves": loss_curves,
-        "X_train_seq": X_train_seq,
-        "y_train_seq": y_train_seq,
-        "X_val_seq": X_val_seq,
-        "y_val_seq": y_val_seq,
+        "X_train_lstm": X_train_lstm,
+        "y_train_lstm": y_train_lstm,
+        "X_val_lstm": X_val_lstm,
+        "y_val_lstm": y_val_lstm,
     }
 
 
