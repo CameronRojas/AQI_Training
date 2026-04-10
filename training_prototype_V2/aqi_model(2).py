@@ -113,7 +113,7 @@ class TimeVariantAutoencoder(nn.Module):
             nn.Linear(input_dim, latent_dim),
             nn.ReLU(),
         )
-        if scaler == MinMaxScaler:
+        if isinstance(scaler, MinMaxScaler):
             self.decoder = nn.Sequential(
                 nn.Linear(latent_dim, input_dim),
                 nn.Sigmoid()
@@ -174,7 +174,7 @@ class AIQTrainingPipeline:
         logger.info(f"Removed NaN values. Shape changed from {initial_shape} to {self.dataset_df.shape}")
 
     def remove_uninformative_features(self):
-        self.dataset_df.drop(columns=self.cfg.cols_to_drop, inplace=True)
+        self.dataset_df.drop(columns=self.cfg.cols_to_drop, inplace=True, errors='ignore')
         logger.info(f"Removed uninformative features: {self.cfg.cols_to_drop}")
 
     def identify_cyclic_features(self):
@@ -441,7 +441,7 @@ def save_artifacts(save_dir: str, model: AQI_LSTM, ae_reducer: AEReducer,
 
     with open(os.path.join(save_dir, "scalers.pkl"), "wb") as f:
         pickle.dump({
-            "scalers": cfg.scalers
+            "scaler": cfg.scalers[1], # StandardScaler for LSTM input
         }, f)
 
     pd.DataFrame([{
@@ -546,7 +546,7 @@ def run(cfg: Config):
     print("  EVALUATION")
     print("=" * 60)
     preds = trainer.predict(model, X_val_lstm)
-    metrics = trainer.evaluate(y_val_lstm, preds, label="LSTM+AE22")
+    metrics = trainer.evaluate(y_val_lstm, preds, label="LSTM+AE16")
 
     save_artifacts(cfg.save_dir, model, ae, pipeline, cfg, metrics, loss_curves, X_train_lstm.shape[2])
 
