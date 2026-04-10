@@ -441,8 +441,7 @@ def save_artifacts(save_dir: str, model: AQI_LSTM, ae_reducer: AEReducer,
 
     with open(os.path.join(save_dir, "scalers.pkl"), "wb") as f:
         pickle.dump({
-            "ae_scaler": pipeline.ae_scaler,
-            "lstm_scaler" : pipeline.lstm_scaler
+            "scalers": cfg.scalers
         }, f)
 
     pd.DataFrame([{
@@ -475,18 +474,47 @@ def run(cfg: Config):
     X_train_ae = np.concatenate([X_train_ae, pipeline.train_df[pipeline.cyclic_cols].to_numpy(dtype=np.float32)], axis=1)
     X_val_ae = np.concatenate([X_val_ae, pipeline.val_df[pipeline.cyclic_cols].to_numpy(dtype=np.float32)], axis=1)
 
+    # Train AE and get latent features
     ae = AEReducer(cfg, input_dim=X_train_ae.shape[1]) # Defaults to StandardScaler in AEReducer, which is what we want for the AE
     X_train_latent = ae.fit_transform(X_train_ae)
     X_val_latent = ae.transform(X_val_ae)
-    latent_cols = [f"z{i}" for i in range(cfg.latent_dim)] # latent_dim is 16, so this will create z0, z1, ..., z21
+    latent_cols = [f"z{i}" for i in range(cfg.latent_dim)] # latent_dim is 16, so this will create z0, z1, ..., z15
 
-    # Now create new train/val sets for LSTM
-    latent_train_df = pd.DataFrame(X_train_latent, columns=latent_cols)
-    latent_val_df = pd.DataFrame(X_val_latent, columns=latent_cols)
 
-    # Combine latent features with original binary/lag features for LSTM training, which are the most predictive of AQI and should be preserved in their original form (not scaled or encoded)
-    lstm_train_df = pd.concat([latent_train_df, pipeline.train_df.drop(columns=pipeline.feature_cols + pipeline.cyclic_cols)], axis=1)
-    lstm_val_df = pd.concat([latent_val_df, pipeline.val_df.drop(columns=pipeline.feature_cols + pipeline.cyclic_cols)], axis=1)
+    # Need to scale the features for the LSTM as well, but we want to preserve the original scaler before the AE transformation
+    base_columns_to_scale = pipeline.train_df.drop(columns=['zip', 'time'] + pipeline.cyclic_cols + pipeline.binary_cols + pipeline.lag_cols).columns
+
+    scaler = cfg.scalers[1] # StandardScaler for LSTM input
+    scaler.fit(pipeline.train_df[base_columns_to_scale]) # dont scale cyclic, binary, or lag features(yet)
+
+    col_idx = {col: idx for idx, col in enumerate(base_columns_to_scale)}
+
+    aqi_lag_cols= [col for col in pipeline.lag_cols if col.startswith('us_aqi_past_')]
+    pm2_5_lag_cols = [col for col in pipeline.lag_cols if col.startswith('pm2_5_past_')]
+    ozone_lag_cols = [col for col in pipeline.lag_cols if col.startswith('ozone_past_')]
+    wind_speed_lag_cols = [col for col in pipeline.lag_cols if col.startswith('wind_speed_10m_past_')]
+
+    def scale_lag_group(train_df, val_df, lag_cols, base_col, scaler, col_idx):
+        idx = col_idx[base_col]
+        train_scaled = (train_df[lag_cols].to_numpy() - scaler.mean_[idx]) / scaler.scale_[idx]
+        val_scaled = (val_df[lag_cols].to_numpy() - scaler.mean_[idx]) / scaler.scale_[idx]
+        return train_scaled, val_scaled
+
+    aqi_lags_scaled_train, aqi_lags_scaled_val = scale_lag_group(pipeline.train_df, pipeline.val_df, aqi_lag_cols, 'us_aqi', scaler, col_idx)
+    pm2_5_lags_scaled_train, pm2_5_lags_scaled_val = scale_lag_group(pipeline.train_df, pipeline.val_df, pm2_5_lag_cols, 'pm2_5', scaler, col_idx)
+    ozone_lags_scaled_train, ozone_lags_scaled_val = scale_lag_group(pipeline.train_df, pipeline.val_df, ozone_lag_cols, 'ozone', scaler, col_idx)
+    wind_speed_lags_scaled_train, wind_speed_lags_scaled_val = scale_lag_group(pipeline.train_df, pipeline.val_df, wind_speed_lag_cols, 'wind_speed_10m', scaler, col_idx)
+
+    # Combine latent features with scaled lag features for LSTM input, while preserving the original binary and cyclic features in their unscaled form (they will be concatenated later). This way we maintain the predictive power of the lag features while also incorporating the compressed information from the AE latent space.
+    latent_lag_scaled_train = np.concatenate([X_train_latent, aqi_lags_scaled_train, pm2_5_lags_scaled_train, ozone_lags_scaled_train, wind_speed_lags_scaled_train], axis=1)
+    latent_lag_scaled_val = np.concatenate([X_val_latent, aqi_lags_scaled_val, pm2_5_lags_scaled_val, ozone_lags_scaled_val, wind_speed_lags_scaled_val], axis=1)
+
+    latent_lag_df = pd.DataFrame(latent_lag_scaled_train, columns=latent_cols + aqi_lag_cols + pm2_5_lag_cols + ozone_lag_cols + wind_speed_lag_cols)
+    latent_val_lag_df = pd.DataFrame(latent_lag_scaled_val, columns=latent_cols + aqi_lag_cols + pm2_5_lag_cols + ozone_lag_cols + wind_speed_lag_cols)
+
+    # Combine latent features with original binary, scaled lag features, and zip/time for LSTM training.
+    lstm_train_df = pd.concat([latent_lag_df, pipeline.train_df[pipeline.binary_cols + ['zip', 'time', 'us_aqi']]], axis=1)
+    lstm_val_df = pd.concat([latent_val_lag_df, pipeline.val_df[pipeline.binary_cols + ['zip', 'time', 'us_aqi']]], axis=1)
 
     # Create sequences for LSTM training
     X_train_lstm, y_train_lstm = pipeline.make_lstm_sequences(lstm_train_df)
@@ -511,7 +539,7 @@ def run(cfg: Config):
         y_train_lstm,
         X_val_lstm,
         y_val_lstm,
-        name="LSTM+AE22"
+        name="LSTM+AE16",
     )
 
     print("\n" + "=" * 60)
