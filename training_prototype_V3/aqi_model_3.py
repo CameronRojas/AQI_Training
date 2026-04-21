@@ -50,13 +50,13 @@ class Config:
     latent_dim: int = 8
     ae_layers = [[16, 4], [8]]
     ae_hidden_dims: List[int] = field(default_factory=list)  # single bottleneck layer only
-    ae_epochs: int = 100
+    ae_epochs: int = 50
     ae_lr: float = 1e-3
     ae_batch_size: int = 1048
 
     # LSTM settings
-    lstm_hidden: int = 512
-    lstm_layers: int = 3
+    lstm_hidden: int = 96
+    lstm_layers: int = 1
     lstm_dropout: float = 1e-4
     lstm_epochs: int = 50
     lstm_lr: float = .00099
@@ -71,7 +71,7 @@ class Config:
     # THESE COLUMNS ARE IRRELEVANT AND ARE DROPPED BECAUSE NOT NEEDED
     cols_to_drop: List[str] = field(default_factory=lambda: [
         'wind_speed_100m', 'month', 'day', 'hour',
-        'day_of_week', 'day_of_year']
+        'day_of_week', 'day_of_year', 'month_sin', 'month_cos']
         )
 ###########################################################################
     @property
