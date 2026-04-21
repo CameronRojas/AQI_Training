@@ -70,8 +70,8 @@ class Config:
 ###########################################################################
     # THESE COLUMNS ARE IRRELEVANT AND ARE DROPPED BECAUSE NOT NEEDED
     cols_to_drop: List[str] = field(default_factory=lambda: [
-        'wind_speed_100m', 'latitude', 'longitude', 
-        'month', 'day', 'hour', 'day_of_week', 'day_of_year']
+        'wind_speed_100m', 'month', 'day', 'hour',
+        'day_of_week', 'day_of_year']
         )
 ###########################################################################
     @property
