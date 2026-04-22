@@ -1,5 +1,3 @@
-# Use average of the mean for each feature to get gaussian distribution for the autoencoder, which is what it learns best. This is a common practice to improve AE performance when features have different scales or distributions.
-
 import logging
 import os
 import time
@@ -36,7 +34,7 @@ logger.info(f'Logger name: {logger.name} and level: {logger.level}')
 
 @dataclass
 class Config:
-    all_data_path: str = "/content/all_features_all_data.csv"
+    all_data_path: str = "../datasets/all_features_training.csv"
 
     # Split/scaling choices
     val_size: float = 0.20
@@ -71,7 +69,7 @@ class Config:
     # THESE COLUMNS ARE IRRELEVANT AND ARE DROPPED BECAUSE NOT NEEDED
     cols_to_drop: List[str] = field(default_factory=lambda: [
         'wind_speed_100m', 'month', 'day', 'hour',
-        'day_of_week', 'day_of_year', 'month_sin', 'month_cos']
+        'day_of_week', 'day_of_year', 'month_sin', 'month_cos',]
         )
 ###########################################################################
     @property
