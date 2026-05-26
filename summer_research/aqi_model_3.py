@@ -503,11 +503,13 @@ def run(cfg: Config):
     ozone_lags_scaled_train, ozone_lags_scaled_val = scale_lag_group(pipeline.train_df, pipeline.val_df, ozone_lag_cols[:8], 'ozone', scaler, col_idx)
 
     # Combine latent features with scaled lag features for LSTM input (binary/cyclic features not concatenated yet)
-    latent_lag_scaled_train = np.concatenate([X_train_latent, aqi_lags_scaled_train, pm2_5_lags_scaled_train, ozone_lags_scaled_train], axis=1)
-    latent_lag_scaled_val = np.concatenate([X_val_latent, aqi_lags_scaled_val, pm2_5_lags_scaled_val, ozone_lags_scaled_val], axis=1)
+    # latent_lag_scaled_train = np.concatenate([X_train_latent, aqi_lags_scaled_train, pm2_5_lags_scaled_train, ozone_lags_scaled_train], axis=1)
+    # latent_lag_scaled_val = np.concatenate([X_val_latent, aqi_lags_scaled_val, pm2_5_lags_scaled_val, ozone_lags_scaled_val], axis=1)
+    latent_lag_scaled_train = np.concatenate([X_train_latent], axis=1)
+    latent_lag_scaled_val = np.concatenate([X_val_latent], axis=1)
 
-    latent_lag_df = pd.DataFrame(latent_lag_scaled_train, columns=latent_cols + aqi_lag_cols + pm2_5_lag_cols[:8] + ozone_lag_cols[:8])
-    latent_val_lag_df = pd.DataFrame(latent_lag_scaled_val, columns=latent_cols + aqi_lag_cols + pm2_5_lag_cols[:8] + ozone_lag_cols[:8])
+    latent_lag_df = pd.DataFrame(latent_lag_scaled_train, columns=latent_cols)
+    latent_val_lag_df = pd.DataFrame(latent_lag_scaled_val, columns=latent_cols)
     print(f"Latent+Lag train shape: {latent_lag_df.shape}")
 
     # Combine latent features with original binary, scaled lag features, and zip/time for LSTM training.
